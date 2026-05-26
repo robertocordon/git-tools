@@ -1,0 +1,386 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use IO::Handle;
+use IO::Select;
+use FindBin;
+use lib "$FindBin::Bin/lib";
+use Terminal;
+
+STDOUT->autoflush(1);
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+my $RESULTS_DIR   = "$ENV{HOME}/results/lab/logs/rsl_rl/ambulonproto";
+my $POLL_INTERVAL = 3;  # seconds between directory / video polls
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+
+sub list_dirs {
+    my ($path) = @_;
+    return () unless -d $path;
+    opendir my $dh, $path or return ();
+    my @dirs = sort grep { !/^\./ && -d "$path/$_" } readdir($dh);
+    closedir $dh;
+    return @dirs;
+}
+
+sub list_videos {
+    my ($path) = @_;
+    return () unless -d $path;
+    opendir my $dh, $path or return ();
+    my @files = sort {
+        my ($xa) = $a =~ /(\d+)/;
+        my ($xb) = $b =~ /(\d+)/;
+        ($xa // 0) <=> ($xb // 0)
+    } grep { /^rl-video-step-\d+\.mp4$/ } readdir($dh);
+    closedir $dh;
+    return @files;
+}
+
+sub get_file_size {
+    my ($path) = @_;
+    my @s = stat($path);
+    return @s ? $s[7] : -1;
+}
+
+sub read_horizon_length {
+    my ($yaml_path) = @_;
+    open my $fh, '<', $yaml_path or return undef;
+    while (<$fh>) {
+        return $1 if /^\s*num_steps_per_env\s*:\s*(\d+)/;
+    }
+    close $fh;
+    return undef;
+}
+
+sub episode_label {
+    my ($filename, $horizon_length) = @_;
+    my ($x) = $filename =~ /(\d+)/;
+    return 'Episode ' . int($x / $horizon_length);
+}
+
+# ── Step 2: Select experiment directory (live-updating) ────────────────────────
+
+sub select_experiment_dir {
+    my $prompt    = 'Select experiment directory:';
+    my $stdin_sel = IO::Select->new(\*STDIN);
+
+    my @initial_dirs = list_dirs($RESULTS_DIR);
+    my %initial_set  = map { $_ => 1 } @initial_dirs;
+
+    my @dirs          = @initial_dirs;
+    my @display       = @initial_dirs;  # no NEW! suffix on first load
+    my $n             = scalar @dirs;
+    my $selected      = $n > 0 ? $n - 1 : 0;
+    my $showing_empty = ($n == 0);
+
+    hide_cursor();
+    enable_raw_mode();
+    print "${FORMAT_BOLD}$prompt${FORMAT_RESET}\n";
+
+    my $render = sub {
+        for my $i (0 .. $n - 1) {
+            clear_line();
+            print $i == $selected
+                ? "  ${FORMAT_REVERSE}> $display[$i] ${FORMAT_RESET}\n"
+                : "    $display[$i]\n";
+        }
+    };
+
+    if ($showing_empty) {
+        clear_line();
+        print "  ${FORMAT_DIM}(no directories found \x{2014} polling...)${FORMAT_RESET}\n";
+    } else {
+        $render->();
+    }
+
+    while (1) {
+        my @ready = $stdin_sel->can_read($POLL_INTERVAL);
+
+        if (@ready) {
+            my $ch = '';
+            sysread(STDIN, $ch, 1);
+
+            if ($ch eq "\e") {
+                my $seq = '';
+                sysread(STDIN, $seq, 2);
+                if ($n > 0) {
+                    if    ($seq eq '[A') { $selected = ($selected - 1 + $n) % $n }
+                    elsif ($seq eq '[B') { $selected = ($selected + 1)      % $n }
+                    move_up($n);
+                    $render->();
+                }
+            } elsif (($ch eq "\n" || $ch eq "\r") && $n > 0) {
+                last;
+            }
+
+        } else {
+            # Timeout: scan for directory changes
+            my @new_dirs    = list_dirs($RESULTS_DIR);
+            my @new_display = map { $initial_set{$_} ? $_ : "$_ - NEW!" } @new_dirs;
+
+            my $changed = (@new_dirs != @dirs);
+            unless ($changed) {
+                for my $i (0 .. $#dirs) {
+                    if ($new_dirs[$i] ne $dirs[$i] || $new_display[$i] ne $display[$i]) {
+                        $changed = 1; last;
+                    }
+                }
+            }
+            next unless $changed;
+
+            # Default to the last item marked NEW!, falling back to last item overall
+            my $new_default = -1;
+            for my $i (0 .. $#new_dirs) {
+                $new_default = $i unless $initial_set{$new_dirs[$i]};
+            }
+
+            my $prev_n = $n;
+            if ($showing_empty) {
+                move_up(1); clear_line();
+            } else {
+                move_up($prev_n);
+                for (0 .. $prev_n - 1) { clear_line(); print "\n" }
+                move_up($prev_n);
+            }
+
+            @dirs    = @new_dirs;
+            @display = @new_display;
+            $n       = scalar @dirs;
+            $selected      = ($new_default >= 0) ? $new_default : ($n > 0 ? $n - 1 : 0);
+            $showing_empty = ($n == 0);
+
+            if ($showing_empty) {
+                clear_line();
+                print "  ${FORMAT_DIM}(no directories found \x{2014} polling...)${FORMAT_RESET}\n";
+            } else {
+                $render->();
+            }
+        }
+    }
+
+    restore_terminal();
+    show_cursor();
+
+    move_up($n + 1);
+    for (0 .. $n) { clear_line(); print "\n" }
+    move_up($n + 1);
+    clear_line();
+    print "${FORMAT_BOLD}$prompt${FORMAT_RESET} ${FORMAT_GREEN}$dirs[$selected]${FORMAT_RESET}\n";
+
+    return "$RESULTS_DIR/$dirs[$selected]";
+}
+
+# ── Step 3: Wait for experiment initialization ─────────────────────────────────
+
+sub wait_for_init {
+    my ($exp_dir) = @_;
+    my $yaml_path = "$exp_dir/params/agent.yaml";
+    my $video_dir = "$exp_dir/videos/train";
+
+    my $dots           = 0;
+    my $showed_message = 0;
+
+    while (1) {
+        if (-f $yaml_path && -d $video_dir) {
+            if ($showed_message) { move_up(1); clear_line() }
+            last;
+        }
+
+        if (!$showed_message) {
+            print "Waiting for initialization\n";
+            $showed_message = 1;
+        } else {
+            $dots++;
+            move_up(1); clear_line();
+            print 'Waiting for initialization' . ('.' x $dots) . "\n";
+        }
+
+        sleep($POLL_INTERVAL);
+    }
+
+    my $horizon_length = read_horizon_length($yaml_path);
+    die "${FORMAT_RED}Error:${FORMAT_RESET} Could not read num_steps_per_env from $yaml_path\n"
+        unless defined $horizon_length;
+
+    return ($video_dir, $horizon_length);
+}
+
+# ── Step 4: Select video to play (live-updating) ───────────────────────────────
+
+sub select_video {
+    my ($video_dir, $horizon_length) = @_;
+    my $prompt    = 'Select video to play:';
+    my $stdin_sel = IO::Select->new(\*STDIN);
+
+    my @files    = list_videos($video_dir);
+    my @display  = map { episode_label($_, $horizon_length) } @files;
+    my $n        = scalar @files;
+    my $selected = $n > 0 ? $n - 1 : 0;
+    my %excluded = ();
+
+    my %prev_sizes = map { $_ => get_file_size("$video_dir/$_") } @files;
+    my %curr_sizes = %prev_sizes;
+    my $showing_empty = ($n == 0);
+
+    hide_cursor();
+    enable_raw_mode();
+    print "${FORMAT_BOLD}$prompt${FORMAT_RESET}\n";
+
+    my $render = sub {
+        for my $i (0 .. $n - 1) {
+            clear_line();
+            my $is_excl = $excluded{$files[$i]};
+            if ($i == $selected) {
+                print $is_excl
+                    ? "  ${FORMAT_BG_RED}${FORMAT_WHITE}> $display[$i] (still writing...)${FORMAT_RESET}\n"
+                    : "  ${FORMAT_REVERSE}> $display[$i] ${FORMAT_RESET}\n";
+            } else {
+                print $is_excl
+                    ? "  ${FORMAT_DIM}  $display[$i]${FORMAT_RESET}\n"
+                    : "    $display[$i]\n";
+            }
+        }
+    };
+
+    if ($showing_empty) {
+        clear_line();
+        print "  ${FORMAT_DIM}(no videos yet \x{2014} polling...)${FORMAT_RESET}\n";
+    } else {
+        $render->();
+    }
+
+    while (1) {
+        my @ready = $stdin_sel->can_read($POLL_INTERVAL);
+
+        if (@ready) {
+            my $ch = '';
+            sysread(STDIN, $ch, 1);
+
+            if ($ch eq "\e") {
+                my $seq = '';
+                sysread(STDIN, $seq, 2);
+                if ($n > 0) {
+                    if ($seq eq '[A') {
+                        my $new_sel = ($selected - 1 + $n) % $n;
+                        my $tries   = 0;
+                        while ($excluded{$files[$new_sel]} && $tries < $n) {
+                            $new_sel = ($new_sel - 1 + $n) % $n;
+                            $tries++;
+                        }
+                        $selected = $new_sel if $tries < $n;
+                    } elsif ($seq eq '[B') {
+                        my $new_sel = ($selected + 1) % $n;
+                        my $tries   = 0;
+                        while ($excluded{$files[$new_sel]} && $tries < $n) {
+                            $new_sel = ($new_sel + 1) % $n;
+                            $tries++;
+                        }
+                        $selected = $new_sel if $tries < $n;
+                    }
+                    move_up($n);
+                    $render->();
+                }
+            } elsif (($ch eq "\n" || $ch eq "\r") && $n > 0) {
+                if ($excluded{$files[$selected]}) {
+                    move_up($n); $render->();
+                } else {
+                    last;
+                }
+            }
+
+        } else {
+            # Timeout: rescan videos, compare sizes, rebuild excluded set
+            my @new_files   = list_videos($video_dir);
+            my @new_display = map { episode_label($_, $horizon_length) } @new_files;
+
+            %prev_sizes = %curr_sizes;
+            %curr_sizes = map { $_ => get_file_size("$video_dir/$_") } @new_files;
+
+            my %new_excluded = ();
+            for my $f (@new_files) {
+                if (exists $prev_sizes{$f} && $prev_sizes{$f} != $curr_sizes{$f}) {
+                    $new_excluded{$f} = 1;
+                }
+            }
+
+            my $list_changed = (@new_files != @files);
+            unless ($list_changed) {
+                for my $i (0 .. $#files) {
+                    if ($new_files[$i] ne $files[$i]) { $list_changed = 1; last }
+                }
+            }
+
+            my $excl_changed = 0;
+            for my $f (@new_files) {
+                if (($new_excluded{$f} // 0) != ($excluded{$f} // 0)) {
+                    $excl_changed = 1; last;
+                }
+            }
+
+            next unless $list_changed || $excl_changed;
+
+            my $prev_n = $n;
+            if ($showing_empty) {
+                move_up(1); clear_line();
+            } else {
+                move_up($prev_n);
+                for (0 .. $prev_n - 1) { clear_line(); print "\n" }
+                move_up($prev_n);
+            }
+
+            @files    = @new_files;
+            @display  = @new_display;
+            %excluded = %new_excluded;
+            $n        = scalar @files;
+            $showing_empty = ($n == 0);
+
+            if ($list_changed && $n > 0) {
+                # Jump to the most recent (bottom) non-excluded file
+                $selected = $n - 1;
+                if ($excluded{$files[$selected]}) {
+                    my $new_sel = $selected;
+                    my $tries   = 0;
+                    while ($excluded{$files[$new_sel]} && $tries < $n) {
+                        $new_sel = ($new_sel - 1 + $n) % $n;
+                        $tries++;
+                    }
+                    $selected = $new_sel if $tries < $n;
+                }
+            } elsif ($n > 0 && $selected >= $n) {
+                $selected = $n - 1;
+            }
+
+            if ($showing_empty) {
+                clear_line();
+                print "  ${FORMAT_DIM}(no videos yet \x{2014} polling...)${FORMAT_RESET}\n";
+            } else {
+                $render->();
+            }
+        }
+    }
+
+    restore_terminal();
+    show_cursor();
+
+    move_up($n + 1);
+    for (0 .. $n) { clear_line(); print "\n" }
+    move_up($n + 1);
+    clear_line();
+    print "${FORMAT_BOLD}$prompt${FORMAT_RESET} ${FORMAT_GREEN}$display[$selected] - $video_dir/$files[$selected]${FORMAT_RESET}\n";
+
+    return "$video_dir/$files[$selected]";
+}
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+my $exp_dir = select_experiment_dir();
+
+my ($video_dir, $horizon_length) = wait_for_init($exp_dir);
+
+while (1) {
+    my $video_path = select_video($video_dir, $horizon_length);
+    system('vlc --no-video-title-show --play-and-exit --quiet ' . quotemeta($video_path) . ' 2>/dev/null');
+}
+
