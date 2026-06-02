@@ -57,7 +57,9 @@ sub enable_raw_mode {
 }
 
 sub restore_terminal {
-    $original_termios->setattr(0, POSIX::TCSANOW) if defined $original_termios;
+    return unless defined $original_termios;
+    $original_termios->setattr(0, POSIX::TCSANOW);
+    $original_termios = undef;
 }
 
 END { restore_terminal(); show_cursor() }
@@ -89,6 +91,8 @@ sub interactive_select {
 
     hide_cursor();
     enable_raw_mode();
+
+    local $SIG{INT} = sub { restore_terminal(); show_cursor(); print STDERR "\n"; exit 1 };
 
     print "${FORMAT_BOLD}$prompt${FORMAT_RESET}\n";
 
@@ -172,6 +176,8 @@ sub prompt_text {
 
     enable_raw_mode();
     show_cursor();
+
+    local $SIG{INT} = sub { restore_terminal(); print STDERR "\n"; exit 1 };
 
     if (defined $hint) {
         print "${FORMAT_BOLD}$prompt${FORMAT_RESET} ${FORMAT_DIM}$hint${FORMAT_RESET}\n";
