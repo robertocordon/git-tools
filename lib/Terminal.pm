@@ -41,11 +41,8 @@ our $FORMAT_BG_RED  = "\e[41m";
 # ── Terminal control ──────────────────────────────────────────────────────────
 
 my $original_termios;
-my $original_stty = '';
 
 sub enable_raw_mode {
-    chomp($original_stty = `stty -g 2>/dev/null`);
-
     $original_termios = POSIX::Termios->new;
     $original_termios->getattr(0);
 
@@ -60,12 +57,9 @@ sub enable_raw_mode {
 }
 
 sub restore_terminal {
-    if ($original_stty ne '') {
-        system("stty $original_stty 2>/dev/null");
-        $original_stty = '';
-    } elsif (defined $original_termios) {
-        $original_termios->setattr(0, POSIX::TCSANOW);
-    }
+    return unless defined $original_termios;
+    $original_termios->setattr(0, POSIX::TCSANOW);
+    $original_termios = undef;
 }
 
 END { restore_terminal(); show_cursor() }
@@ -97,6 +91,8 @@ sub interactive_select {
 
     hide_cursor();
     enable_raw_mode();
+
+    local $SIG{INT} = sub { restore_terminal(); show_cursor(); print STDERR "\n"; exit 1 };
 
     print "${FORMAT_BOLD}$prompt${FORMAT_RESET}\n";
 
@@ -180,6 +176,8 @@ sub prompt_text {
 
     enable_raw_mode();
     show_cursor();
+
+    local $SIG{INT} = sub { restore_terminal(); print STDERR "\n"; exit 1 };
 
     if (defined $hint) {
         print "${FORMAT_BOLD}$prompt${FORMAT_RESET} ${FORMAT_DIM}$hint${FORMAT_RESET}\n";
