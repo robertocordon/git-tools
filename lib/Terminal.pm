@@ -41,8 +41,11 @@ our $FORMAT_BG_RED  = "\e[41m";
 # ── Terminal control ──────────────────────────────────────────────────────────
 
 my $original_termios;
+my $original_stty = '';
 
 sub enable_raw_mode {
+    chomp($original_stty = `stty -g 2>/dev/null`);
+
     $original_termios = POSIX::Termios->new;
     $original_termios->getattr(0);
 
@@ -57,7 +60,12 @@ sub enable_raw_mode {
 }
 
 sub restore_terminal {
-    $original_termios->setattr(0, POSIX::TCSANOW) if defined $original_termios;
+    if ($original_stty ne '') {
+        system("stty $original_stty 2>/dev/null");
+        $original_stty = '';
+    } elsif (defined $original_termios) {
+        $original_termios->setattr(0, POSIX::TCSANOW);
+    }
 }
 
 END { restore_terminal(); show_cursor() }
