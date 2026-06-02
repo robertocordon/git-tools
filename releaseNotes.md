@@ -1,5 +1,13 @@
 # Release Notes
 
+## [v1.3] (2026-06-01)
+
+### New Features
+* New script for monitoring and viewing Isaac Lab progress videos
+
+### Bug Fixes
+* Fix issue with Terminal in Ubuntu where we'd lose our cursor when exiting scripts that were displaying a menu at the time
+
 ## [v1.2] (2026-05-09)
 
 * Git Merge and Git Release tools support pushing the changes that they made
